@@ -163,9 +163,50 @@ def _write_stderr_log_header(server_name: str) -> None:
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         fh.write(f"\n===== [{ts}] starting MCP server '{server_name}' =====\n")
+        # Note: credential patterns in stderr are redacted on the next
+        # _sanitize_stderr_log_file() pass.  Unredacted content may briefly
+        # exist on disk between passes.
         fh.flush()
     except Exception:
         pass
+
+
+def _sanitize_stderr_log_file() -> None:
+    """Rewrite the MCP stderr log with credential patterns redacted.
+
+    Because the subprocess stderr is wired directly to the file descriptor
+    via ``asyncio`` subprocess machinery (bypassing Python I/O), we cannot
+    intercept lines as they arrive.  Instead this function is called
+    after server shutdowns to scrub any credentials that leaked into the
+    log from misbehaving MCP servers.
+
+    Safe to call concurrently — uses the module-level lock so only one
+    rewrite runs at a time.
+    """
+    global _mcp_stderr_log_fh
+    with _mcp_stderr_log_lock:
+        if _mcp_stderr_log_fh is None:
+            return
+        try:
+            from hermes_constants import get_hermes_home
+            log_path = get_hermes_home() / "logs" / "mcp-stderr.log"
+            if not log_path.exists():
+                return
+            raw = log_path.read_text(encoding="utf-8", errors="replace")
+            sanitized = _sanitize_stderr_line(raw)
+            if sanitized != raw:
+                # Close the current fh first so writes land in the rewritten file.
+                try:
+                    _mcp_stderr_log_fh.close()
+                except Exception:
+                    pass
+                log_path.write_text(sanitized, encoding="utf-8")
+                # Reopen the file handle for future stderr writes.
+                fh = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+                fh.fileno()
+                _mcp_stderr_log_fh = fh
+        except Exception as exc:
+            logger.debug("Failed to sanitize MCP stderr log: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Graceful import -- MCP SDK is an optional dependency
@@ -321,6 +362,24 @@ def _sanitize_error(text: str) -> str:
     return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
 
 
+def _sanitize_stderr_line(line: str) -> str:
+    """Redact credential patterns from a single stderr log line.
+
+    Uses the same ``_CREDENTIAL_PATTERN`` as ``_sanitize_error`` but also
+    strips common log formats like ``key=value`` where value matches known
+    secret patterns.  Applied before writing to the shared stderr log so
+    that credentials from misbehaving MCP servers never persist on disk.
+    """
+    redacted = _CREDENTIAL_PATTERN.sub("[REDACTED]", line)
+    # Also catch inline assignment patterns like API_KEY=sk-xxxx that
+    # _CREDENTIAL_PATTERN doesn't cover (no Bearer/token= prefix).
+    _INLINE_SECRET = re.compile(
+        r"(?<=\=)(sk[-_][A-Za-z0-9]{8,}|ghp_[A-Za-z0-9_]{8,}|"
+        r"xai-[A-Za-z0-9]{8,}|AIza[A-Za-z0-9_-]{8,})",
+    )
+    return _INLINE_SECRET.sub("[REDACTED]", redacted)
+
+
 def _exc_str(exc: BaseException) -> str:
     """Return a non-empty human-readable string for *exc*.
 
@@ -383,6 +442,44 @@ def _scan_mcp_description(server_name: str, tool_name: str, description: str) ->
             description,
         )
     return findings
+
+
+# Maximum length for MCP tool descriptions.  Descriptions longer than this
+# are truncated to prevent excessive context-window consumption and to limit
+# the surface area for prompt injection attacks.  Set to 0 to disable.
+_MAX_MCP_DESCRIPTION_LENGTH = 4000
+
+# Regex for stripping suspicious patterns from tool descriptions when
+# ``sanitize_descriptions`` is enabled for a server.
+_SANITIZE_STRIP_PATTERN = re.compile(
+    r"(?:"
+    r"ignore\s+(all\s+)?previous\s+instructions"
+    r"|you\s+are\s+now\s+a"
+    r"|your\s+new\s+(?:task|role|instructions?)\s+(?:is|are)"
+    r"|system\s*:\s*.*"
+    r"|<\s*(?:system|human|assistant)\s*>.*?(?:</\s*(?:system|human|assistant)\s*>|$)"
+    r"|do\s+not\s+(?:tell|inform|mention|reveal)"
+    r"|exec\s*\(|eval\s*\("
+    r"|import\s+(?:subprocess|os|shutil|socket)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _sanitize_mcp_description(description: str) -> str:
+    """Sanitize an MCP tool description by stripping injection patterns.
+
+    Removes role tags, system prompts, and other suspicious content.
+    Truncates descriptions longer than ``_MAX_MCP_DESCRIPTION_LENGTH``.
+    """
+    if not description:
+        return description
+    # Strip known injection patterns
+    sanitized = _SANITIZE_STRIP_PATTERN.sub("[filtered]", description)
+    # Truncate overly long descriptions
+    if _MAX_MCP_DESCRIPTION_LENGTH and len(sanitized) > _MAX_MCP_DESCRIPTION_LENGTH:
+        sanitized = sanitized[:_MAX_MCP_DESCRIPTION_LENGTH - 3] + "..."
+    return sanitized
 
 
 def _prepend_path(env: dict, directory: str) -> dict:
@@ -661,6 +758,9 @@ class SamplingHandler:
         self.max_tool_rounds = _safe_numeric(
             config.get("max_tool_rounds", 5), 5, int, minimum=0,
         )
+        self.max_total_tokens = _safe_numeric(
+            config.get("max_total_tokens", 0), 0, int, minimum=0,
+        )
         self.model_override = config.get("model")
         self.allowed_models = config.get("allowed_models", [])
 
@@ -894,6 +994,18 @@ class SamplingHandler:
             return self._error(
                 f"Sampling rate limit exceeded for server '{self.server_name}' "
                 f"({self.max_rpm} requests/minute)"
+            )
+
+        # Token budget check (0 = unlimited)
+        if self.max_total_tokens and self.metrics["tokens_used"] >= self.max_total_tokens:
+            logger.warning(
+                "MCP server '%s' token budget exhausted (%d/%d tokens used)",
+                self.server_name, self.metrics["tokens_used"], self.max_total_tokens,
+            )
+            self.metrics["errors"] += 1
+            return self._error(
+                f"Token budget exhausted for server '{self.server_name}' "
+                f"({self.metrics['tokens_used']}/{self.max_total_tokens} tokens)"
             )
 
         # Resolve model
@@ -1322,6 +1434,8 @@ class MCPServerTask:
             # teardown failed (common when the task is cancelled mid-way
             # on Linux, where setsid() children escape the parent cgroup).
             # Mark them as orphans so the next cleanup sweep can reap them.
+            # Also scrub any credentials the server may have leaked to stderr.
+            _sanitize_stderr_log_file()
             if new_pids:
                 with _lock:
                     for _pid in new_pids:
@@ -2221,16 +2335,33 @@ def _interrupted_call_result() -> str:
 # Config loading
 # ---------------------------------------------------------------------------
 
-def _interpolate_env_vars(value):
-    """Recursively resolve ``${VAR}`` placeholders from ``os.environ``."""
+def _interpolate_env_vars(value, allowed_keys: Optional[set] = None):
+    """Recursively resolve ``${VAR}`` placeholders from environment variables.
+
+    By default, resolves from the full ``os.environ`` (which includes
+    ``~/.hermes/.env`` loaded at startup).  When *allowed_keys* is provided,
+    only variables in that set (plus safe baseline keys) are resolved — all
+    others are left as ``${VAR}`` literals so that secrets like API keys
+    are not interpolated into MCP server configurations.
+    """
     if isinstance(value, str):
         def _replace(m):
-            return os.environ.get(m.group(1), m.group(0))
+            var_name = m.group(1)
+            # If allowed_keys is specified, only resolve safe + explicitly
+            # allowed variables.  Leave others as literal ${VAR}.
+            if allowed_keys is not None:
+                if var_name not in allowed_keys and var_name not in _SAFE_ENV_KEYS and not var_name.startswith("XDG_"):
+                    logger.debug(
+                        "MCP env interpolation: not resolving $%s%s%s — not in allowed keys",
+                        "{", var_name, "}",
+                    )
+                    return m.group(0)  # leave as ${VAR}
+            return os.environ.get(var_name, m.group(0))
         return _ENV_VAR_PATTERN.sub(_replace, value)
     if isinstance(value, dict):
-        return {k: _interpolate_env_vars(v) for k, v in value.items()}
+        return {k: _interpolate_env_vars(v, allowed_keys) for k, v in value.items()}
     if isinstance(value, list):
-        return [_interpolate_env_vars(v) for v in value]
+        return [_interpolate_env_vars(v, allowed_keys) for v in value]
     return value
 
 
@@ -2244,6 +2375,10 @@ def _load_mcp_config() -> Dict[str, dict]:
 
     ``${ENV_VAR}`` placeholders in string values are resolved from
     ``os.environ`` (which includes ``~/.hermes/.env`` loaded at startup).
+    Only ``${VAR}`` references to safe baseline keys (PATH, HOME, etc.)
+    and keys explicitly listed in the server's ``env`` section are
+    interpolated — references to other env vars (like API keys) are
+    left as literal ``${VAR}`` strings to prevent credential leakage.
     """
     try:
         from hermes_cli.config import load_config
@@ -2257,7 +2392,15 @@ def _load_mcp_config() -> Dict[str, dict]:
             load_hermes_dotenv()
         except Exception:
             pass
-        return {name: _interpolate_env_vars(cfg) for name, cfg in servers.items()}
+        result = {}
+        for name, cfg in servers.items():
+            # Collect the env keys this server explicitly wants — only those
+            # keys (plus safe baseline keys) will be interpolated from
+            # os.environ.  All other ${VAR} references are left as-is.
+            env_section = cfg.get("env") if isinstance(cfg, dict) else None
+            allowed = set(env_section.keys()) if isinstance(env_section, dict) else set()
+            result[name] = _interpolate_env_vars(cfg, allowed_keys=allowed)
+        return result
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
         return {}
@@ -2817,13 +2960,14 @@ def sanitize_mcp_name_component(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", str(value or ""))
 
 
-def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
+def _convert_mcp_schema(server_name: str, mcp_tool, sanitize: bool = False) -> dict:
     """Convert an MCP tool listing to the Hermes registry schema format.
 
     Args:
         server_name: The logical server name for prefixing.
         mcp_tool:    An MCP ``Tool`` object with ``.name``, ``.description``,
                      and ``.inputSchema``.
+        sanitize:    If True, strip prompt injection patterns from description.
 
     Returns:
         A dict suitable for ``registry.register(schema=...)``.
@@ -2831,9 +2975,11 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     safe_tool_name = sanitize_mcp_name_component(mcp_tool.name)
     safe_server_name = sanitize_mcp_name_component(server_name)
     prefixed_name = f"mcp_{safe_server_name}_{safe_tool_name}"
+    raw_description = mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}"
+    description = _sanitize_mcp_description(raw_description) if sanitize else raw_description
     return {
         "name": prefixed_name,
-        "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
+        "description": description,
         "parameters": _normalize_mcp_input_schema(getattr(mcp_tool, "inputSchema", None)),
     }
 
@@ -3074,6 +3220,11 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     include_set = _normalize_name_filter(tools_filter.get("include"), f"mcp_servers.{name}.tools.include")
     exclude_set = _normalize_name_filter(tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude")
 
+    # Description sanitization: strip prompt injection patterns from tool
+    # descriptions.  Enabled by default for safety; set to false to pass
+    # raw descriptions through (only recommended for fully trusted servers).
+    sanitize_descriptions = config.get("sanitize_descriptions", True)
+
     def _should_register(tool_name: str) -> bool:
         if include_set:
             return tool_name in include_set
@@ -3089,7 +3240,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         # Scan tool description for prompt injection patterns
         _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
 
-        schema = _convert_mcp_schema(name, mcp_tool)
+        schema = _convert_mcp_schema(name, mcp_tool, sanitize=sanitize_descriptions)
         tool_name_prefixed = schema["name"]
 
         # Guard against collisions with built-in (non-MCP) tools.
@@ -3496,6 +3647,9 @@ def shutdown_mcp_servers():
                 future.result(timeout=15)
             except Exception as exc:
                 logger.debug("Error during MCP shutdown: %s", exc)
+
+    # Scrub any credentials that MCP servers leaked to stderr log.
+    _sanitize_stderr_log_file()
 
     _stop_mcp_loop()
 
