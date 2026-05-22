@@ -27,6 +27,7 @@ class ResponsesApiTransport(ProviderTransport):
         return _chat_messages_to_responses_input(
             messages,
             is_xai_responses=bool(kwargs.get("is_xai_responses")),
+            is_xai_oauth=bool(kwargs.get("is_xai_oauth")),
         )
 
     def convert_tools(self, tools: List[Dict[str, Any]]) -> Any:
@@ -56,7 +57,9 @@ class ResponsesApiTransport(ProviderTransport):
             base_url_hostname: str | None — hostname for backend detection
             is_github_responses: bool — Copilot/GitHub models backend
             is_codex_backend: bool — chatgpt.com/backend-api/codex
-            is_xai_responses: bool — xAI/Grok backend
+            is_xai_responses: bool — xAI/Grok backend (both API-key and OAuth)
+            is_xai_oauth: bool — xAI OAuth/SuperGrok — suppress encrypted
+                reasoning replay + include (some surfaces 400 on replayed blobs)
             github_reasoning_extra: dict | None — Copilot reasoning params
         """
         from agent.codex_responses_adapter import (
@@ -78,6 +81,7 @@ class ResponsesApiTransport(ProviderTransport):
         is_github_responses = params.get("is_github_responses", False)
         is_codex_backend = params.get("is_codex_backend", False)
         is_xai_responses = params.get("is_xai_responses", False)
+        is_xai_oauth = params.get("is_xai_oauth", False)
 
         # Resolve reasoning effort
         reasoning_effort = "medium"
@@ -99,6 +103,7 @@ class ResponsesApiTransport(ProviderTransport):
             "input": _chat_messages_to_responses_input(
                 payload_messages,
                 is_xai_responses=is_xai_responses,
+                is_xai_oauth=is_xai_oauth,
             ),
             "tools": response_tools,
             "store": False,
@@ -113,7 +118,7 @@ class ResponsesApiTransport(ProviderTransport):
         if not is_github_responses and not is_xai_responses and session_id:
             kwargs["prompt_cache_key"] = session_id
 
-        if reasoning_enabled and is_xai_responses:
+        if reasoning_enabled and is_xai_responses and not is_xai_oauth:
             from agent.model_metadata import grok_supports_reasoning_effort
 
             # Ask xAI to echo back encrypted reasoning items so we can
@@ -126,6 +131,17 @@ class ResponsesApiTransport(ProviderTransport):
             # those models reason natively. Only send the effort dial when
             # the target model is on the allowlist; otherwise send no
             # `reasoning` key at all and let the model reason on its own.
+            if grok_supports_reasoning_effort(model):
+                kwargs["reasoning"] = {"effort": reasoning_effort}
+        elif reasoning_enabled and is_xai_responses and is_xai_oauth:
+            # OAuth/SuperGrok (xai-oauth provider) path: some surfaces
+            # reject replay of prior-turn encrypted_content with 400 on
+            # multi-turn tool calls (#30310). Do not request the blob;
+            # native server-side reasoning + full message history is
+            # sufficient. Effort is still forwarded when the model supports it.
+            from agent.model_metadata import grok_supports_reasoning_effort
+
+            kwargs["include"] = []
             if grok_supports_reasoning_effort(model):
                 kwargs["reasoning"] = {"effort": reasoning_effort}
         elif reasoning_enabled:

@@ -248,19 +248,16 @@ def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
     *,
     is_xai_responses: bool = False,
+    is_xai_oauth: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
-    ``is_xai_responses`` is kept for transport signature compatibility but
-    no longer suppresses encrypted reasoning replay.  Earlier (PR #26644,
-    May 2026) we believed xAI's OAuth/SuperGrok ``/v1/responses`` surface
-    rejected replayed ``encrypted_content`` reasoning items minted by
-    prior turns, and we stripped them.  That decision was wrong — xAI
-    explicitly relies on Hermes threading encrypted reasoning back across
-    turns for cross-turn coherence (the whole point of their partnership
-    integration).  We now replay encrypted reasoning on every Responses
-    transport (xAI, native Codex, custom relays) and let xAI tell us
-    explicitly if a specific surface ever rejects a payload.
+    ``is_xai_responses`` controls general xAI Responses behavior.
+    When ``is_xai_oauth=True`` (SuperGrok / OAuth users) we suppress
+    replay of ``encrypted_content`` reasoning items even if the general
+    policy is to thread them.  Some xAI OAuth surfaces have historically
+    rejected replayed blobs with 400 (see #30310).  The API-key path
+    ("xai" provider) continues to use full replay for partnership coherence.
     """
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
@@ -292,7 +289,7 @@ def _chat_messages_to_responses_input(
                 # for the May 2026 reversal of the earlier xAI gate.
                 codex_reasoning = msg.get("codex_reasoning_items")
                 has_codex_reasoning = False
-                if isinstance(codex_reasoning, list):
+                if isinstance(codex_reasoning, list) and not (is_xai_responses and is_xai_oauth):
                     for ri in codex_reasoning:
                         if isinstance(ri, dict) and ri.get("encrypted_content"):
                             item_id = ri.get("id")
@@ -356,21 +353,32 @@ def _chat_messages_to_responses_input(
                         items.append(replay_item)
                         replayed_message_items += 1
 
+                # Quick check so we skip the empty assistant placeholder when
+                # function_call items will follow (they satisfy the "following
+                # item after reasoning" rule). An empty content assistant is
+                # rejected by some xAI surfaces with the same 400.
+                tool_calls = msg.get("tool_calls")
+                has_tool_calls = bool(
+                    isinstance(tool_calls, list)
+                    and any(
+                        isinstance(tc, dict)
+                        and ((tc.get("function") or {}).get("name") or "").strip()
+                        for tc in tool_calls
+                    )
+                )
+
                 if replayed_message_items > 0:
                     pass
                 elif content_parts:
                     items.append({"role": "assistant", "content": content_parts})
                 elif content_text.strip():
                     items.append({"role": "assistant", "content": content_text})
-                elif has_codex_reasoning:
+                elif has_codex_reasoning and not has_tool_calls:
                     # The Responses API requires a following item after each
-                    # reasoning item (otherwise: missing_following_item error).
-                    # When the assistant produced only reasoning with no visible
-                    # content, emit an empty assistant message as the required
-                    # following item.
+                    # reasoning item. When only reasoning (no text) *and* no
+                    # tool calls, emit the empty assistant as placeholder.
                     items.append({"role": "assistant", "content": ""})
 
-                tool_calls = msg.get("tool_calls")
                 if isinstance(tool_calls, list):
                     for tc in tool_calls:
                         if not isinstance(tc, dict):

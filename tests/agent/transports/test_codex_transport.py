@@ -452,3 +452,23 @@ class TestCodexNormalizeResponse:
         tc = nr.tool_calls[0]
         assert tc.name == "terminal"
         assert '"command"' in tc.arguments
+
+    # Regression coverage for #30310 (xAI OAuth 400 on replayed reasoning)
+    def test_xai_oauth_suppresses_encrypted_replay(self, transport):
+        history = [
+            {"role": "user", "content": "tool please"},
+            {"role": "assistant", "content": "", "codex_reasoning_items": [{"type": "reasoning", "encrypted_content": "blob"}]},
+        ]
+        kw = transport.build_kwargs(
+            model="grok-4.3", messages=history, tools=[],
+            is_xai_responses=True, is_xai_oauth=True,
+        )
+        inp = kw.get("input", [])
+        assert not any(i.get("encrypted_content") for i in inp if isinstance(i, dict))
+
+    def test_xai_oauth_sets_empty_include(self, transport):
+        kw = transport.build_kwargs(
+            model="grok-4.3", messages=[{"role": "user", "content": "hi"}], tools=[],
+            is_xai_responses=True, is_xai_oauth=True, reasoning_config={"effort": "medium"},
+        )
+        assert kw.get("include") == [] or "reasoning.encrypted_content" not in (kw.get("include") or [])
